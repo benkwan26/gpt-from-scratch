@@ -1,68 +1,125 @@
-# Hyperparameters
-VOCAB_SIZE = 276 # Desired final vocabulary size
+import regex as re
+from collections import defaultdict
+from config import VOCAB_SIZE, PATTERN
 
-with open('data/input.txt', 'r', encoding='utf-8') as f:
-    text = f.read()
+def bytes_to_unicode():
+    bs = list(range(33, 127)) + list(range(161, 256))
+    cs = bs[:]
+    n = 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + n)
+            n += 1
+    return dict(zip(bs, map(chr, cs)))
 
-tokens = text.encode('utf-8')
-tokens = list(map(int, tokens))
+class BPE:
+    def __init__(self, text):
+        self.byte_encoder = bytes_to_unicode()
+        self.byte_decoder = {v: k for k, v in self.byte_encoder.items()}
+        self._train(text)
 
-def count_pairs(tokens):
-    counts = {}
-    for pair in zip(tokens, tokens[1:]):
-        counts[pair] = counts.get(pair, 0) + 1
-    
-    return counts
+    # ---------- BPE TRAINING ----------
+    def _get_vocab(self, text):
+        vocab = defaultdict(int)
 
-def merge_pairs(tokens, pair, new_token):
-    # In the list tokens, replace all consecutive occurrences of pair with new_token
-    new_tokens = []
-    i = 0
-    while i < len(tokens):
-        # If we are not at the very last position AND the pair matches, replace it
-        if i < len(tokens) - 1 and (tokens[i], tokens[i + 1]) == pair:
-            new_tokens.append(new_token)
-            i += 2
-        else:
-            new_tokens.append(tokens[i])
-            i += 1
+        for token in re.findall(PATTERN, text):
+            chars = ''.join(self.byte_encoder[b] for b in token.encode("utf-8"))
+            vocab[tuple(chars)] += 1
 
-    return new_tokens
+        return vocab
 
-num_merges = VOCAB_SIZE - 256
-ids = list(tokens)
+    def _get_stats(self, vocab):
+        pairs = defaultdict(int)
 
-merges = {} # (int, int) -> int
-for i in range(num_merges):
-    pair_counts = count_pairs(ids)
-    top_pair = max(pair_counts, key=pair_counts.get)
-    idx = 256 + i
-    ids = merge_pairs(ids, top_pair, idx)
-    merges[top_pair] = idx
+        for word, freq in vocab.items():
+            for i in range(len(word) - 1):
+                pairs[(word[i], word[i + 1])] += freq
 
-vocab = {idx: bytes([idx]) for idx in range(256)}
-for (p0, p1), idx in merges.items():
-    vocab[idx] = vocab[p0] + vocab[p1]
+        return pairs
 
-def decode(ids):
-    # Given ids (list of integers), return a Python string
-    tokens = b"".join(vocab[idx] for idx in ids)
-    text = tokens.decode('utf-8', errors='replace')
+    def _merge_vocab(self, pair, vocab):
+        new_vocab = {}
 
-    return text
+        for word, freq in vocab.items():
+            new_word = []
+            i = 0
 
-def encode(text):
-    # Given a string, return a list of integers (the tokens)
-    tokens = list(text.encode('utf-8'))
+            while i < len(word):
+                if i < len(word) - 1 and (word[i], word[i + 1]) == pair:
+                    new_word.append(word[i] + word[i + 1])
+                    i += 2
+                else:
+                    new_word.append(word[i])
+                    i += 1
 
-    while len(tokens) >= 2:
-        pair_counts = count_pairs(tokens)
-        pair = min(pair_counts, key=lambda p: merges.get(p, float('inf')))
+            new_vocab[tuple(new_word)] = freq
 
-        if pair not in merges:
-            break # Nothing else can be merged
+        return new_vocab
 
-        idx = merges[pair]
-        tokens = merge_pairs(tokens, pair, idx)
-    
-    return tokens
+    def _train(self, text):
+        vocab = self._get_vocab(text)
+        merges = []
+
+        for _ in range(VOCAB_SIZE - 256):
+            stats = self._get_stats(vocab)
+            if not stats:
+                break
+            best = max(stats, key=stats.get)
+            merges.append(best)
+            vocab = self._merge_vocab(best, vocab)
+
+        self.bpe_ranks = {pair: i for i, pair in enumerate(merges)}
+
+        tokens = set()
+        for word in vocab:
+            tokens.update(word)
+
+        self.token_to_id = {t: i for i, t in enumerate(tokens)}
+        self.id_to_token = {i: t for t, i in self.token_to_id.items()}
+        self.vocab_size = len(self.token_to_id)
+
+    # ---------- ENCODE / DECODE ----------
+    def _bpe(self, token):
+        word = tuple(token)
+        pairs = {(word[i], word[i + 1]) for i in range(len(word) - 1)}
+
+        while True:
+            pair = min(
+                pairs,
+                key=lambda p: self.bpe_ranks.get(p, float("inf")),
+                default=None
+            )
+            if pair not in self.bpe_ranks:
+                break
+
+            new_word = []
+            i = 0
+            while i < len(word):
+                if i < len(word) - 1 and (word[i], word[i + 1]) == pair:
+                    new_word.append(word[i] + word[i + 1])
+                    i += 2
+                else:
+                    new_word.append(word[i])
+                    i += 1
+            word = tuple(new_word)
+            pairs = {(word[i], word[i + 1]) for i in range(len(word) - 1)}
+
+        return word
+
+    def encode(self, text):
+        ids = []
+
+        for token in re.findall(PATTERN, text):
+            chars = ''.join(self.byte_encoder[b] for b in token.encode("utf-8"))
+
+            for t in self._bpe(chars):
+                ids.append(self.token_to_id[t])
+
+        return ids
+
+    def decode(self, ids):
+        text = ''.join(self.id_to_token[i] for i in ids)
+        bytes_ = bytearray(self.byte_decoder[c] for c in text)
+
+        return bytes_.decode("utf-8", errors="replace")
